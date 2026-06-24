@@ -1,0 +1,76 @@
+name: Check samples list
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare README against live org repos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '18 months ago' +%Y-%m-%dT%H:%M:%SZ)
+
+          # Repos linked in the README, and the set that currently qualifies as listable:
+          # public, not archived, pushed within the window. Stale and missing both derive
+          # from this one objective set — no name heuristic, so no false positives.
+          listed=$(grep -oE 'github\.com/zoom/[A-Za-z0-9._-]+' profile/README.md | sed 's#.*/##' | sort -u)
+          qualifying=$(gh api --paginate orgs/zoom/repos \
+            --jq '.[] | select(.private==false and .archived==false and .pushed_at > "'"$cutoff"'") | .name' | sort -u)
+
+          # Denylist: org repos that are NOT samples and should never be suggested
+          # (libraries, infra forks, whitepapers). Add a name here when one shows up.
+          ignore=$(printf '%s\n' \
+            .github \
+            gubernator \
+            karpenter \
+            karpenter-oci \
+            vercel-chat \
+            zoom-data-fence \
+            zoom-e2e-whitepaper \
+            | sort -u)
+
+          # Candidates to add: qualifying repos that are neither listed nor denied.
+          missing=$(comm -13 <(echo "$listed") <(echo "$qualifying") | comm -13 <(echo "$ignore") -)
+          # Stale: listed repos that no longer qualify (archived, deleted/renamed, or stale).
+          stale=$(comm -23 <(echo "$listed") <(echo "$qualifying"))
+
+          if [ -z "$missing" ] && [ -z "$stale" ]; then
+            echo "README is up to date."
+            exit 0
+          fi
+
+          {
+            echo "Automated check found drift between the samples README and the live \`zoom\` org repos."
+            echo
+            if [ -n "$missing" ]; then
+              echo "### Candidates to add"
+              echo "$missing" | sed 's#^#- https://github.com/zoom/#'
+              echo
+            fi
+            if [ -n "$stale" ]; then
+              echo "### Listed but no longer qualifying (archived, removed, or stale)"
+              echo "$stale" | sed 's#^#- https://github.com/zoom/#'
+              echo
+            fi
+            echo "_Edit \`profile/README.md\` to reconcile, then close this issue._"
+          } > body.md
+
+          title="Samples list needs review"
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file body.md
+          else
+            gh issue create --title "$title" --body-file body.md
+          fi
